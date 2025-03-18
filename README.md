@@ -2,11 +2,6 @@
 # Prithvi Finetuning
 This repo contains materials for Prithvi Global Finetuning. Here, we will cover geospatial foundation models and Weather Foundation model. We will also be fine-tuning the aforementioned models for specific usecases. For the purposes of this tutorial, we will be utilizing AWS sagemaker environment. The repo will also demonstrate how to get inferences from the fine-tuned prithvi models after the training is complete.
 
-# Slides:
-[Geospatial Foundation Model - Dr. Sujit Roy](https://docs.google.com/presentation/d/1i06aDGXIHcXYLqzXNkBRaA4EC3ggpD2E/edit?usp=drive_link&ouid=110979708004719970003&rtpof=true&sd=true)
-
-[Prithvi Weather and Foundation Model - Dr. Rajat Shinde](https://docs.google.com/presentation/d/14jnTbak9xAt36Bfy15oBH8pcR_AiKa9p/edit?usp=drive_link&ouid=110979708004719970003&rtpof=true&sd=true)
-
 # Prerequisites
 1. Basic understanding of git
 2. Python and jupyter environment knowledge
