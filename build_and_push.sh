@@ -1,11 +1,15 @@
-%%sh
-docker build . --platform linux/amd64 -t sagemaker-build
+#!/bin/bash
 
-export ECR_URL="<aws-account-id>.dkr.ecr.us-west-2.amazonaws.com"
+# Simple Azure Container Registry build and push script
+# Update these variables:
+ACR_NAME="your-acr-name"
+IMAGE_NAME="azureml-hls"
+TAG="latest"
 
-aws ecr get-login-password --region us-west-2 | \
-  docker login --password-stdin --username AWS $ECR_URL
+# Build and push
+docker build . --platform linux/amd64 -t ${IMAGE_NAME}:${TAG}
+az acr login --name ${ACR_NAME}
+docker tag ${IMAGE_NAME}:${TAG} ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}
+docker push ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}
 
-docker tag sagemaker-build $ECR_URL/sagemaker_hls:latest
-
-docker push $ECR_URL/sagemaker_hls:latest
+echo "✅ Image pushed: ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${TAG}"
