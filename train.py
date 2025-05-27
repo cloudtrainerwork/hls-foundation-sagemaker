@@ -1,7 +1,6 @@
 from __future__ import absolute_import
 
 import argparse
-import boto3
 import copy
 import mmcv
 import os
@@ -9,7 +8,6 @@ import os.path as osp
 import random as rd
 import subprocess
 import sys
-import time
 import time
 import torch
 import torch.distributed as dist
@@ -25,81 +23,197 @@ from mmseg.datasets import build_dataset
 from mmseg.models import build_segmentor
 from mmseg.utils import collect_env, get_device, get_root_logger, setup_multi_processes
 
-from utils import print_files_in_path, save_model_artifacts
+# Azure ML imports
+from azureml.core import Run, Dataset, Workspace
+from azure.storage.blob import BlobServiceClient
+from azure.identity import DefaultAzureCredential
 
-ROLE_ARN = os.environ.get('ROLE_ARN')
-ROLE_NAME = os.environ.get('ROLE_NAME')
+from utils import print_files_in_path, save_model_artifacts, log_metrics, log_artifact
+
+# Azure ML Run context
+try:
+    run = Run.get_context()
+    ws = run.experiment.workspace
+    print(f"Running in Azure ML experiment: {run.experiment.name}")
+except:
+    # For local development/testing
+    ws = Workspace.from_config() if os.path.exists('.azureml/config.json') else None
+    run = None
+    print("Running locally - no Azure ML context")
 
 
-def assumed_role_session():
-    # Assume the "notebookAccessRole" role we created using AWS CDK.
-    client = boto3.client('sts')
-    # creds = client.assume_role(RoleArn=ROLE_ARN, RoleSessionName=ROLE_NAME)['Credentials']
-    return boto3.session.Session(
-        # aws_access_key_id=creds['AccessKeyId'],
-        # aws_secret_access_key=creds['SecretAccessKey'],
-        # aws_session_token=creds['SessionToken'],
-        # region_name='us-east-1',
-    )
+def get_azure_storage_client():
+    """Get Azure Blob Storage client for data access"""
+    storage_account_url = os.environ.get('AZURE_STORAGE_ACCOUNT_URL')
+    if not storage_account_url:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_URL environment variable is required")
+    
+    try:
+        # Use managed identity (recommended for Azure ML compute)
+        credential = DefaultAzureCredential()
+        return BlobServiceClient(account_url=storage_account_url, credential=credential)
+    except:
+        # Fallback to connection string
+        connection_string = os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
+        if connection_string:
+            return BlobServiceClient.from_connection_string(connection_string)
+        else:
+            raise Exception("No valid Azure Storage credentials found")
 
 
-def download_data(data, split):
-    split_folder = f"/opt/ml/data/{split}"
-    if not (os.path.exists(split_folder)):
+def download_data_from_blob(blob_url, split):
+    """
+    Download data from Azure Blob Storage
+    
+    Args:
+        blob_url (str): Azure blob URL (e.g., https://account.blob.core.windows.net/container/path)
+        split (str): Data split name (training, validation, test, etc.)
+    """
+    split_folder = f"/tmp/data/{split}"  # Changed from /opt/ml/data to /tmp/data
+    if not os.path.exists(split_folder):
         os.makedirs(split_folder)
-    session = assumed_role_session()
-    s3_connection = session.resource('s3')
-    splits = data.split('/')
-    bucket_name = splits[2]
-    bucket = s3_connection.Bucket(bucket_name)
-    objects = list(bucket.objects.filter(Prefix="/".join(splits[3:] + [split])))
-    print("Downloading files.")
-    for iter_object in objects:
-        splits = iter_object.key.split('/')
-        if splits[-1]:
-            filename = f"{split_folder}/{splits[-1]}"
-            bucket.download_file(iter_object.key, filename)
-    print("Finished downloading files.")
+    
+    try:
+        blob_service_client = get_azure_storage_client()
+        
+        # Parse blob URL to get container and prefix
+        url_parts = blob_url.replace('https://', '').split('/')
+        container_name = url_parts[1]
+        prefix = '/'.join(url_parts[2:]) + f'/{split}' if len(url_parts) > 2 else split
+        
+        container_client = blob_service_client.get_container_client(container_name)
+        
+        print(f"Downloading {split} data from {container_name}/{prefix}")
+        
+        # List and download blobs with the specified prefix
+        blob_list = container_client.list_blobs(name_starts_with=prefix)
+        
+        for blob in blob_list:
+            if blob.name.endswith('/'):  # Skip directories
+                continue
+                
+            filename = blob.name.split('/')[-1]
+            if filename:  # Only download actual files
+                local_path = os.path.join(split_folder, filename)
+                
+                # Create subdirectories if needed
+                local_dir = os.path.dirname(local_path)
+                if not os.path.exists(local_dir):
+                    os.makedirs(local_dir)
+                
+                blob_client = blob_service_client.get_blob_client(
+                    container=container_name, 
+                    blob=blob.name
+                )
+                
+                with open(local_path, "wb") as download_file:
+                    download_file.write(blob_client.download_blob().readall())
+                
+                print(f"Downloaded: {filename}")
+        
+        print(f"Finished downloading {split} data.")
+        
+    except Exception as e:
+        print(f"Error downloading data for {split}: {str(e)}")
+        raise
+
+
+def download_data_from_dataset(dataset_name, split):
+    """
+    Alternative: Download data from Azure ML Dataset
+    
+    Args:
+        dataset_name (str): Name of the registered Azure ML dataset
+        split (str): Data split name
+    """
+    if not ws:
+        print("No workspace context available for dataset download")
+        return
+    
+    try:
+        dataset = Dataset.get_by_name(ws, f"{dataset_name}_{split}")
+        split_folder = f"/tmp/data/{split}"
+        
+        print(f"Downloading dataset: {dataset_name}_{split}")
+        dataset.download(target_path=split_folder, overwrite=True)
+        print(f"Downloaded dataset to: {split_folder}")
+        
+    except Exception as e:
+        print(f"Dataset {dataset_name}_{split} not found, trying blob storage method: {str(e)}")
+        # Fallback to blob storage method
+        blob_url = os.environ.get('AZURE_BLOB_URL', os.environ.get('DATA_URL'))
+        if blob_url:
+            download_data_from_blob(blob_url, split)
+
+
+def setup_logging_and_metrics():
+    """Setup Azure ML logging integration"""
+    if run:
+        # Log environment info to Azure ML
+        env_info = {
+            'python_version': sys.version,
+            'torch_version': torch.__version__,
+            'cuda_available': torch.cuda.is_available(),
+            'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0
+        }
+        
+        for key, value in env_info.items():
+            run.log(f"env_{key}", str(value))
 
 
 def train():
-    # print("\nList of files in train channel: ")
-    # print_files_in_path(os.environ.get("SM_CHANNEL_TRAIN"))
+    """Main training function"""
+    
+    # Setup Azure ML logging
+    setup_logging_and_metrics()
+    
+    # Print data channel info (Azure ML equivalent)
+    train_path = os.environ.get("AZUREML_DATAREFERENCE_TRAIN", "/tmp/data/training")
+    validation_path = os.environ.get("AZUREML_DATAREFERENCE_VALIDATION", "/tmp/data/validation")
+    test_path = os.environ.get("AZUREML_DATAREFERENCE_TEST", "/tmp/data/test")
+    
+    print(f"\nTrain data path: {train_path}")
+    print(f"Validation data path: {validation_path}")
+    print(f"Test data path: {test_path}")
 
-    # print("\nList of files in validation channel: ")
-    # print_files_in_path(os.environ.get("SM_CHANNEL_VALIDATION"))
+    config_file = os.environ.get('CONFIG_FILE', '/tmp/data/configs/default_config.py')
+    print(f'\nConfig file: {config_file}')
 
-    # print("\nList of files in Test channel: ")
-    # print_files_in_path(os.environ.get("SM_CHANNEL_TEST"))
+    print(f"Environment variables: {dict(os.environ)}")
 
-    config_file = os.environ.get('CONFIG_FILE')
-    print(f'\n config file: {config_file}')
-
-    print(f"Environment variables: {os.environ}")
-
-    # Dummy net.
-    net = None
-
-    # download and prepare data for training:
+    # Download and prepare data for training
+    data_source = os.environ.get('AZURE_BLOB_URL', os.environ.get('DATA_URL'))
+    dataset_name = os.environ.get('DATASET_NAME')
+    
     for split in ['training', 'validation', 'test', 'configs', 'models']:
-        download_data(os.environ.get('S3_URL'), split)
+        try:
+            if dataset_name:
+                # Try Azure ML Dataset first
+                download_data_from_dataset(dataset_name, split)
+            elif data_source:
+                # Fallback to direct blob storage
+                download_data_from_blob(data_source, split)
+            else:
+                print(f"Warning: No data source specified for {split}")
+        except Exception as e:
+            print(f"Warning: Could not download {split} data: {str(e)}")
 
-    # for root, dirs, files in os.walk("/opt/ml/data", topdown=False):
-    #     for name in files:
-    #         print("files:", os.path.join(root, name))
-    #     for name in dirs:
-    #         print("files:", os.pvimath.join(root, name))
-
-    # subprocess.run(f"mim train mmsegmentation {config_file} --launcher pytorch --gpus 1".split(' '))
-    # set random seeds
+    # Load configuration
     cfg = Config.fromfile(config_file)
     cfg.device = get_device()
     seed = init_random_seed(10, device=cfg.device)
-    # init the logger before other steps
+    
+    # Initialize logger
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-    model_path = f"/opt/ml/code/{os.environ['VERSION']}/{os.environ['EVENT_TYPE']}/"
-    os.makedirs(model_path)
+    
+    # Azure ML specific model path - use outputs directory
+    model_path = f"./outputs/{os.environ.get('VERSION', 'v1')}/{os.environ.get('EVENT_TYPE', 'training')}/"
+    os.makedirs(model_path, exist_ok=True)
 
+    # Update work directory for Azure ML
+    if cfg.get('work_dir', None) is None:
+        cfg.work_dir = osp.join('./outputs/work_dirs', osp.splitext(osp.basename(config_file))[0])
+    
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
     logger = get_root_logger(log_file=log_file, log_level=cfg.log_level)
 
@@ -107,58 +221,59 @@ def train():
     set_random_seed(seed, deterministic=True)
     cfg.seed = seed
 
+    # Log seed to Azure ML
+    if run:
+        run.log('random_seed', seed)
+
+    # Setup distributed training environment
     os.environ['RANK'] = str(torch.cuda.device_count())
     os.environ['WORLD_SIZE'] = '1'
     os.environ['MASTER_PORT'] = str(rd.randint(20000, 30000))
     os.environ['MASTER_ADDR'] = '127.0.0.1'
 
-    # set cudnn_benchmark
+    # Set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):
         torch.backends.cudnn.benchmark = True
 
-    if cfg.get('work_dir', None) is None:
-        # use config filename as default work_dir if cfg.work_dir is None
-        cfg.work_dir = osp.join('./work_dirs', osp.splitext(osp.basename(config_file))[0])
     cfg.gpu_ids = range(1)
-
     distributed = False
     print('#######', cfg.dist_params)
 
-    # init_dist('pytorch', **cfg.dist_params)
-
-    # gpu_ids is used to calculate iter when resuming checkpoint
-    # _, world_size = get_dist_info()
-    # cfg.gpu_ids = range(world_size)
-
-    # create work_dir
+    # Create work directory
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
-    # dump config
+    
+    # Dump config
     cfg.dump(osp.join(cfg.work_dir, osp.basename(config_file)))
+    
+    # Log config file to Azure ML
+    if run:
+        run.upload_file(name="outputs/config.py", path_or_stream=osp.join(cfg.work_dir, osp.basename(config_file)))
 
-    # set multi-process settings
+    # Set multi-process settings
     setup_multi_processes(cfg)
 
-    # init the meta dict to record some important information such as
-    # environment info and seed, which will be logged
+    # Initialize metadata
     meta = dict()
-    # log env info
+    
+    # Log environment info
     env_info_dict = collect_env()
     env_info = '\n'.join([f'{k}: {v}' for k, v in env_info_dict.items()])
     dash_line = '-' * 60 + '\n'
     logger.info('Environment info:\n' + dash_line + env_info + '\n' + dash_line)
     meta['env_info'] = env_info
 
-    # log some basic info
+    # Log basic info
     logger.info(f'Distributed training: {distributed}')
     logger.info(f'Config:\n{cfg.pretty_text}')
 
     meta['seed'] = seed
     meta['exp_name'] = osp.basename(config_file)
 
+    # Build model
     model = build_segmentor(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
     model.init_weights()
 
-    # SyncBN is not support for DP
+    # Handle SyncBN for non-distributed training
     if not distributed:
         warnings.warn(
             'SyncBN is only supported with DDP. To be compatible with DP, '
@@ -169,48 +284,82 @@ def train():
 
     logger.info(model)
 
+    # Build datasets
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)
         val_dataset.pipeline = cfg.data.train.pipeline
         datasets.append(build_dataset(val_dataset))
+    
+    # Setup checkpoint configuration
     if cfg.checkpoint_config is not None:
-        # save mmseg version, config file content and class names in
-        # checkpoints as meta data
         cfg.checkpoint_config.meta = dict(
             mmseg_version=f'{__version__}+{get_git_hash()[:7]}',
             config=cfg.pretty_text,
             CLASSES=datasets[0].CLASSES,
             PALETTE=datasets[0].PALETTE,
         )
-    # add an attribute for visualization convenience
+    
+    # Add model classes
     model.CLASSES = datasets[0].CLASSES
-    # passing checkpoint meta for saving best checkpoint
     meta.update(cfg.checkpoint_config.meta)
+    
+    # Custom hook for Azure ML logging
+    class AzureMLLoggerHook:
+        def __init__(self, run_context):
+            self.run = run_context
+        
+        def log_metrics(self, metrics):
+            if self.run:
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        self.run.log(key, value)
+    
+    # Add Azure ML logger hook to config if we have a run context
+    if run:
+        azure_logger = AzureMLLoggerHook(run)
+    
+    # Start training
+    print("Starting training...")
     train_segmentor(
         model, datasets, cfg, distributed=distributed, validate=True, timestamp=timestamp, meta=meta
     )
-
-    # At the end of the training loop, we have to save model artifacts.
-    model_dir = os.environ["MODEL_DIR"]
-    session = assumed_role_session()
-    s3_connection = session.resource('s3')
-    save_model_artifacts(s3_connection, model_path)
+    
+    print("Training completed. Saving model artifacts...")
+    
+    # Save model artifacts using Azure ML
+    save_model_artifacts(model_path)
+    
+    # Log final model directory contents
+    if run:
+        for root, dirs, files in os.walk(cfg.work_dir):
+            for file in files:
+                if file.endswith(('.pth', '.json', '.log')):
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, cfg.work_dir)
+                    run.upload_file(name=f"outputs/{relative_path}", path_or_stream=file_path)
+    
+    print("Model artifacts saved successfully!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # sagemaker-containers passes hyperparameters as arguments
+    # Hyperparameters (same as before)
     parser.add_argument("--hp1", type=str)
     parser.add_argument("--hp2", type=int, default=50)
     parser.add_argument("--hp3", type=float, default=0.1)
 
-    # This is a way to pass additional arguments when running as a script
-    # and use sagemaker-containers defaults to set their values when not specified.
-    parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN"))
-    parser.add_argument("--validation", type=str, default=os.environ.get("SM_CHANNEL_VALIDATION"))
+    # Azure ML data references (equivalent to SageMaker channels)
+    parser.add_argument("--train", type=str, default=os.environ.get("AZUREML_DATAREFERENCE_TRAIN", "/tmp/data/training"))
+    parser.add_argument("--validation", type=str, default=os.environ.get("AZUREML_DATAREFERENCE_VALIDATION", "/tmp/data/validation"))
 
     args = parser.parse_args()
+    
+    # Log hyperparameters to Azure ML
+    if run:
+        run.log('hp1', args.hp1 or 'None')
+        run.log('hp2', args.hp2)
+        run.log('hp3', args.hp3)
 
     train()
