@@ -1,4 +1,14 @@
-boto3
+# Azure ML and Azure Storage dependencies (replacing AWS)
+azureml-core>=1.54.0
+azureml-mlflow>=1.54.0
+azureml-dataset-runtime
+azureml-train-core
+azureml-train-automl-client
+azure-storage-blob>=12.17.0
+azure-identity>=1.13.0
+azure-keyvault-secrets>=4.7.0
+
+# Machine Learning and Data Processing (unchanged)
 joblib
 morecantile
 opencv-python
@@ -8,10 +18,15 @@ geojson
 scipy
 Pillow==9.4.0
 numpy
+datasets
+huggingface
+
+# Web Framework (unchanged)
 pydantic==1.10.11
 fastapi
 starlette
 uvicorn
-datasets
-huggingface
-sagemaker-training
+
+# Removed AWS-specific packages:
+# boto3 - replaced with azure-storage-blob
+# sagemaker-training - replaced with azureml-core
